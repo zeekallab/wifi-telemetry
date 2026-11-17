@@ -1,0 +1,60 @@
+[
+  {
+    "ts": 1700000000.27,
+    "event_type": "final",
+    "first_seen": 1700000000.01,
+    "last_seen": 1700000000.02,
+    "mac": "5e:9d:58:26:67:48",
+    "locally_administered": true,
+    "observed_roles": [
+      "peer-receiver"
+    ],
+    "bssids": [
+      "60:60:1f:58:ec:cc"
+    ],
+    "ssids": [
+      "Lab-WiFi"
+    ],
+    "probe_ssids": [],
+    "tx_frame_types": [],
+    "rx_frame_types": [
+      "data-subtype-0"
+    ],
+    "tx_frames": 0,
+    "rx_frames": 2,
+    "frequency_mhz": 2412,
+    "band": "2.4 GHz",
+    "tracking_limited": false
+  },
+  {
+    "ts": 1700000000.27,
+    "event_type": "final",
+    "first_seen": 1700000000.0,
+    "last_seen": 1700000000.27,
+    "mac": "60:60:1f:58:ec:cc",
+    "mac_oui": "60:60:1f",
+    "locally_administered": false,
+    "observed_roles": [
+      "bssid-transmitter"
+    ],
+    "bssids": [
+      "60:60:1f:58:ec:cc"
+    ],
+    "ssids": [
+      "Lab-WiFi"
+    ],
+    "probe_ssids": [],
+    "tx_frame_types": [
+      "data-subtype-0",
+      "deauthentication",
+      "beacon"
+    ],
+    "rx_frame_types": [],
+    "tx_frames": 28,
+    "rx_frames": 0,
+    "frequency_mhz": 2412,
+    "band": "2.4 GHz",
+    "signal_dbm": -42,
+    "tracking_limited": false
+  }
+]

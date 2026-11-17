@@ -1,0 +1,25 @@
+{
+  "ts": 1700000000.22,
+  "first_seen": 1700000000.03,
+  "last_seen": 1700000000.22,
+  "bssid": "60:60:1f:58:ec:cc",
+  "bssid_oui": "60:60:1f",
+  "ssid": "Lab-WiFi",
+  "frequency_mhz": 2412,
+  "band": "2.4 GHz",
+  "finding": "deauthentication_burst",
+  "evidence": "distinct-unprotected-non-retry-disconnect-frames",
+  "frame_count": 20,
+  "threshold": 20,
+  "window": 10.0,
+  "observed_transmitters": [
+    "60:60:1f:58:ec:cc"
+  ],
+  "observed_receivers": [
+    "ff:ff:ff:ff:ff:ff"
+  ],
+  "reason_codes": [
+    7
+  ],
+  "tracking_limited": false
+}

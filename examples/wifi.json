@@ -1,0 +1,44 @@
+{
+  "ts": 1700000000.27,
+  "event_type": "final",
+  "first_seen": 1700000000.0,
+  "last_seen": 1700000000.27,
+  "bssid": "60:60:1f:58:ec:cc",
+  "bssid_oui": "60:60:1f",
+  "ssid": "Lab-WiFi",
+  "ssids": [
+    "Lab-WiFi"
+  ],
+  "hidden_ssid_observed": false,
+  "advertised_privacy": true,
+  "rsn_observed": false,
+  "wpa_vendor_ie_observed": false,
+  "advertised_channels": [
+    1
+  ],
+  "frequency_mhz": 2412,
+  "band": "2.4 GHz",
+  "signal_dbm": -42,
+  "frames": 28,
+  "management_frames": 26,
+  "data_frames": 2,
+  "beacon_frames": 1,
+  "probe_response_frames": 0,
+  "authentication_frames": 0,
+  "association_request_frames": 0,
+  "association_response_frames": 0,
+  "deauth_frames": 25,
+  "disassoc_frames": 0,
+  "eapol_key_frames": 2,
+  "retry_frames": 0,
+  "protected_frames": 0,
+  "reason_codes": [
+    7
+  ],
+  "status_codes": [],
+  "management_subtypes": [
+    "deauthentication",
+    "beacon"
+  ],
+  "tracking_limited": false
+}
