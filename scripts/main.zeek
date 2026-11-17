@@ -1,13 +1,30 @@
-# Standalone raw radiotap/802.11 telemetry. No drone-detector dependency.
-# The guarded compatibility copy in drone-detector/scripts/wifi.zeek is generated
-# from this file by tools/sync_compat.py. Keep policy out of the drone namespace.
+# Standalone 802.11 telemetry from radiotap captures or raw 802.11 forwarded in
+# GRE protocol 0x8200. No drone-detector dependency; keep policy out of the drone
+# namespace. The guard lets two copies load, in either order, with one set of handlers.
 @ifndef (WiFiTelemetry::NETWORK_LOG)
 @load ./oui
 module WiFiTelemetry;
 
 export {
     redef enum Log::ID += { NETWORK_LOG, DEVICE_LOG, FINDING_LOG };
+    ## Minimum time between update snapshots of one network.
     const log_interval = 60secs &redef;
+    ## Minimum time between update snapshots of one device.
+    const device_log_interval = 60secs &redef;
+    ## Accept raw 802.11 (no radiotap, no FCS) forwarded inside GRE protocol 0x8200.
+    ## An optional GRE key carries capture frequency MHz (high 16 bits) and signal
+    ## dBm (low 16 bits, two's complement); zero in either half means unknown.
+    const gre_input = T &redef;
+    ## GRE 0x8200 is accepted only when sent to one of these decoy addresses.
+    const gre_decoys: set[addr] = { 10.254.200.1 } &redef;
+    ## Log devices with locally administered (often randomized) MACs. When F they
+    ## are still counted in each network's randomized_devices.
+    const log_randomized_devices = T &redef;
+    ## Create device records for MACs seen only in control frames (RTS/CTS/ACK).
+    ## When F, control frames only update devices already known from other frames.
+    const log_control_only_devices = T &redef;
+    ## Distinct locally administered MACs counted per network.
+    const max_randomized_per_network: count = 1024 &redef;
     const state_timeout = 5min &redef;
     const burst_interval = 10secs &redef;
     const minimum_disconnect_frames: count = 20 &redef;
@@ -51,6 +68,7 @@ export {
         reason_codes: set[count] &log;
         status_codes: set[count] &log;
         management_subtypes: set[string] &log;
+        randomized_devices: count &log &default=0;
         tracking_limited: bool &log &default=F;
     };
     type DeviceInfo: record {
@@ -128,7 +146,25 @@ type Network: record {
     last_log: time &optional;
     deauth: Burst &default=Burst();
     disassoc: Burst &default=Burst();
+    randomized: set[string] &default=set();
 };
+type Forwarded: record {
+    valid: bool &default=F;
+    radio: Radio;
+    data: string &default="";
+};
+
+# Constant subtype sets: set literals inside the per-frame path would allocate per packet.
+const ctl_receiver_only: set[count] = { 12, 13 };
+const ctl_transmitter_receiver: set[count] = { 8, 9, 10, 11, 14, 15 };
+const addressed_kinds: set[count] = { 0, 2 };
+const advert_subtypes: set[count] = { 5, 8 };
+const disconnect_subtypes: set[count] = { 10, 12 };
+const status_subtypes: set[count] = { 1, 3, 11 };
+const assoc_request_subtypes: set[count] = { 0, 2 };
+const assoc_response_subtypes: set[count] = { 1, 3 };
+const eapol_versions: set[count] = { 1, 2, 3 };
+const eapol_descriptors: set[count] = { 2, 254 };
 type Device: record {
     info: DeviceInfo;
     dirty: bool &default=T;
@@ -158,10 +194,14 @@ function byte(data: string, offset: count): count
     { return bytestring_to_count(data[offset:offset+1]); }
 function le16(data: string, offset: count): count
     { return bytestring_to_count(data[offset:offset+2],T); }
+function be16(data: string, offset: count): count
+    { return bytestring_to_count(data[offset:offset+2]); }
 function mac(data: string): string
     { return fmt("%02x:%02x:%02x:%02x:%02x:%02x",byte(data,0),byte(data,1),byte(data,2),byte(data,3),byte(data,4),byte(data,5)); }
 function unicast(data: string): bool
     { return |data| == 6 && byte(data,0)%2 == 0 && data != "\x00\x00\x00\x00\x00\x00"; }
+function locally_administered(data: string): bool
+    { return (byte(data,0)/2)%2 == 1; }
 
 # Classify captured frequency, not an ambiguous channel number or an SSID claim.
 # This is a band label, not a statement about local regulatory authorization.
@@ -223,6 +263,45 @@ function radio(raw: string): Radio
     return r;
     }
 
+# Ethernet [802.1Q/802.1ad tags] / IPv4 / GRE protocol 0x8200 / raw 802.11.
+# Only an unfragmented packet or the first IP fragment is decoded; management
+# frames fit in one, and later fragments carry no 802.11 header. Frames carry no
+# FCS and no radiotap, so frequency and signal come only from the optional key.
+function forwarded(raw: string): Forwarded
+    {
+    local f=Forwarded($radio=Radio($offset=0));
+    if ( |raw| < 14 ) return f;
+    local off: count=12;
+    local et=be16(raw,off);
+    while ( (et == 0x8100 || et == 0x88a8) && |raw| >= off+6 ) { off+=4; et=be16(raw,off); }
+    off+=2;
+    if ( et != 0x0800 || |raw| < off+20 ) return f;
+    local ihl=(byte(raw,off)%16)*4;
+    if ( byte(raw,off)/16 != 4 || ihl < 20 || byte(raw,off+9) != 47 ) return f;
+    if ( be16(raw,off+6)%8192 != 0 ) return f;                          # later fragment
+    local limit=off+be16(raw,off+2);
+    if ( limit > |raw| ) limit=|raw|;
+    local g=off+ihl;
+    if ( limit < g+4 || be16(raw,g+2) != 0x8200 ) return f;
+    local gflags=be16(raw,g);
+    if ( gflags%8 != 0 ) return f;                                      # GRE version 0 only
+    local h=g+4;
+    if ( gflags >= 32768 ) h+=4;                                        # checksum present
+    if ( (gflags/8192)%2 == 1 )                                         # key present
+        {
+        if ( limit < h+4 ) return f;
+        local mhz=be16(raw,h); local sig=be16(raw,h+2);
+        if ( mhz != 0 ) f$radio$frequency=mhz;
+        if ( sig != 0 ) f$radio$signal=to_int(fmt("%d",sig))-(sig >= 32768 ? 65536 : 0);
+        h+=4;
+        }
+    if ( (gflags/4096)%2 == 1 ) h+=4;                                   # sequence present
+    if ( limit < h+2 ) return f;
+    f$data=raw[h:limit];
+    f$valid=T;
+    return f;
+    }
+
 # All IEs must fit before any identity/security metadata is accepted. The
 # privacy bit and the presence of RSN/WPA IEs are claims, not negotiated security.
 function tags(data: string, start: count): Tags
@@ -282,7 +361,7 @@ function device_network_names(d: Device)
 
 function emit_device(d: Device, final: bool)
     {
-    if ( ! final && d?$last_log && network_time()-d$last_log < log_interval ) return;
+    if ( ! final && d?$last_log && network_time()-d$last_log < device_log_interval ) return;
     device_network_names(d);
     if ( d$info?$mac_oui )
         {
@@ -317,15 +396,18 @@ function frame_name(kind: count, subtype: count): string
     return fmt("data-subtype-%d",subtype);
     }
 
-function observe_device(address: string, tx: bool, bs: string, role: string, frame_type: string, probe: Tags, r: Radio)
+function observe_device(address: string, tx: bool, bs: string, role: string, frame_type: string, probe: Tags, r: Radio,
+                        control_only: bool &default=F)
     {
     if ( ! unicast(address) ) return;
+    if ( ! log_randomized_devices && locally_administered(address) ) return;
     local key=mac(address);
     if ( key !in devices )
         {
+        if ( control_only && ! log_control_only_devices ) return;
         if ( |devices| >= max_devices ) { capacity_hit(); return; }
         devices[key]=Device($info=DeviceInfo($ts=network_time(),$event_type="observation",
-            $first_seen=network_time(),$last_seen=network_time(),$mac=key,$locally_administered=(byte(address,0)/2)%2 == 1,
+            $first_seen=network_time(),$last_seen=network_time(),$mac=key,$locally_administered=locally_administered(address),
             $observed_roles=set(),$bssids=set(),$probe_ssids=set(),$tx_frame_types=set(),$rx_frame_types=set()));
         local oui=global_oui(key);
         if ( oui != "" )
@@ -407,24 +489,30 @@ function disconnect(n: Network, data: string, disassoc: bool)
 
 event zeek_init() &priority=5
     {
-    if ( log_interval <= 0secs || state_timeout <= 0secs || burst_interval <= 0secs || finding_interval <= 0secs ||
+    if ( log_interval <= 0secs || device_log_interval <= 0secs || state_timeout <= 0secs ||
+         burst_interval <= 0secs || finding_interval <= 0secs ||
          minimum_disconnect_frames == 0 || max_networks == 0 || max_devices == 0 || max_values == 0 ||
-         max_recent_frames < minimum_disconnect_frames )
+         max_randomized_per_network == 0 || max_recent_frames < minimum_disconnect_frames )
         Reporter::fatal("WiFiTelemetry: positive intervals/capacities required; max_recent_frames must cover minimum_disconnect_frames");
     Log::create_stream(NETWORK_LOG,[$columns=NetworkInfo,$path="wifi"]);
     Log::create_stream(DEVICE_LOG,[$columns=DeviceInfo,$path="wifi_devices"]);
     Log::create_stream(FINDING_LOG,[$columns=FindingInfo,$path="wifi_findings"]);
     }
 
-event raw_packet(p: raw_pkt_hdr)
+function count_randomized(n: Network, address: string)
     {
-    if ( p$l2$encap == LINK_ETHERNET ) return;
-    local raw=get_current_packet()$data;
-    local r=radio(raw);
-    if ( r$offset == 0 || (r$flags/64)%2 == 1 ) return; # Bad FCS.
-    local data=raw[r$offset:];
-    if ( (r$flags/16)%2 == 1 )
-        { if ( |data| < 4 ) return; data=data[:|data|-4]; }
+    if ( ! unicast(address) || ! locally_administered(address) ) return;
+    local key=mac(address);
+    if ( key == n$info$bssid || key in n$randomized ) return;
+    if ( |n$randomized| >= max_randomized_per_network ) { n$info$tracking_limited=T; return; }
+    add n$randomized[key];
+    n$info$randomized_devices=|n$randomized|;
+    }
+
+# One undamaged 802.11 frame starting at frame control, without FCS. r carries
+# whatever radio metadata the input supplied (radiotap fields or the GRE key).
+function frame(r: Radio, data: string)
+    {
     if ( |data| < 2 || byte(data,0)%4 != 0 ) return;
     local fc=byte(data,0); local flags=byte(data,1);
     local kind=(fc/4)%4; local subtype=fc/16;
@@ -432,16 +520,16 @@ event raw_packet(p: raw_pkt_hdr)
     # Control frames have no reliable BSSID. Only decode defined address layouts.
     if ( kind == 1 )
         {
-        if ( subtype in set(12,13) && |data| >= 10 )
-            observe_device(data[4:10],F,"","",frame_type,Tags(),r);
-        else if ( subtype in set(8,9,10,11,14,15) && |data| >= 16 )
+        if ( subtype in ctl_receiver_only && |data| >= 10 )
+            observe_device(data[4:10],F,"","",frame_type,Tags(),r,T);
+        else if ( subtype in ctl_transmitter_receiver && |data| >= 16 )
             {
-            observe_device(data[10:16],T,"","",frame_type,Tags(),r);
-            observe_device(data[4:10],F,"","",frame_type,Tags(),r);
+            observe_device(data[10:16],T,"","",frame_type,Tags(),r,T);
+            observe_device(data[4:10],F,"","",frame_type,Tags(),r,T);
             }
         return;
         }
-    if ( kind !in set(0,2) || |data| < 24 ) return;
+    if ( kind !in addressed_kinds || |data| < 24 ) return;
     local protected=(flags/64)%2 == 1;
     local retry=(flags/8)%2 == 1;
     local fragmented=(flags/4)%2 == 1 || le16(data,22)%16 != 0;
@@ -454,15 +542,15 @@ event raw_packet(p: raw_pkt_hdr)
     local t=Tags(); local probe=Tags();
     if ( kind == 0 && ! protected && ! fragmented )
         {
-        if ( subtype in set(5,8) )
+        if ( subtype in advert_subtypes )
             {
             if ( |data| < 36 || data[10:16] != data[16:22] ) return;
             t=tags(data,36); if ( ! t$valid ) return;
             t$privacy=(le16(data,34)/16)%2 == 1;
             }
         else if ( subtype == 4 ) { probe=tags(data,24); if ( ! probe$valid ) return; }
-        else if ( subtype in set(10,12) && |data| < 26 ) return;
-        else if ( subtype in set(1,3,11) && |data| < 30 ) return;
+        else if ( subtype in disconnect_subtypes && |data| < 26 ) return;
+        else if ( subtype in status_subtypes && |data| < 30 ) return;
         else if ( subtype == 0 && |data| < 28 ) return;
         else if ( subtype == 2 && |data| < 34 ) return;
         }
@@ -508,6 +596,7 @@ event raw_packet(p: raw_pkt_hdr)
     if ( r?$signal && data[10:16] == address ) info$signal_dbm=r$signal;
     if ( retry ) ++info$retry_frames;
     if ( protected ) ++info$protected_frames;
+    count_randomized(n,data[4:10]); count_randomized(n,data[10:16]);
     if ( t?$ssid )
         {
         if ( t$hidden ) info$hidden_ssid_observed=T;
@@ -532,21 +621,21 @@ event raw_packet(p: raw_pkt_hdr)
         if ( subtype == 8 ) ++info$beacon_frames;
         else if ( subtype == 5 ) ++info$probe_response_frames;
         else if ( subtype == 11 ) ++info$authentication_frames;
-        else if ( subtype in set(0,2) ) ++info$association_request_frames;
-        else if ( subtype in set(1,3) ) ++info$association_response_frames;
+        else if ( subtype in assoc_request_subtypes ) ++info$association_request_frames;
+        else if ( subtype in assoc_response_subtypes ) ++info$association_response_frames;
         else if ( subtype == 12 ) ++info$deauth_frames;
         else if ( subtype == 10 ) ++info$disassoc_frames;
         add info$management_subtypes[frame_type];
         if ( ! protected && ! fragmented )
             {
-            if ( subtype in set(10,12) )
+            if ( subtype in disconnect_subtypes )
                 {
                 local reason=le16(data,24);
                 if ( |info$reason_codes| < max_values || reason in info$reason_codes ) add info$reason_codes[reason];
                 else info$tracking_limited=T;
                 if ( ! retry && unicast(data[10:16]) ) disconnect(n,data,subtype == 10);
                 }
-            else if ( subtype in set(1,3,11) )
+            else if ( subtype in status_subtypes )
                 {
                 local status=le16(data,subtype == 11 ? 28 : 26);
                 if ( |info$status_codes| < max_values || status in info$status_codes ) add info$status_codes[status];
@@ -570,8 +659,8 @@ event raw_packet(p: raw_pkt_hdr)
             if ( supported && |data| >= header+12 && data[header:header+8] == "\xaa\xaa\x03\x00\x00\x00\x88\x8e" )
                 {
                 local e=header+8; local length=bytestring_to_count(data[e+2:e+4]);
-                if ( byte(data,e) in set(1,2,3) && byte(data,e+1) == 3 && length >= 95 &&
-                     |data| >= e+4+length && byte(data,e+4) in set(2,254) ) ++info$eapol_key_frames;
+                if ( byte(data,e) in eapol_versions && byte(data,e+1) == 3 && length >= 95 &&
+                     |data| >= e+4+length && byte(data,e+4) in eapol_descriptors ) ++info$eapol_key_frames;
                 }
             }
         }
@@ -579,6 +668,25 @@ event raw_packet(p: raw_pkt_hdr)
     # Learn advertised network names before emitting the first device snapshot.
     observe_device(data[10:16],T,bs,tx_role,frame_type,probe,r);
     observe_device(data[4:10],F,bs,rx_role,frame_type,Tags(),r);
+    }
+
+event raw_packet(p: raw_pkt_hdr)
+    {
+    if ( p$l2$encap == LINK_ETHERNET )
+        {
+        # Cheap filter first: only GRE to a configured decoy reaches the parser.
+        if ( ! gre_input || ! p?$ip || p$ip$p != 47 || p$ip$dst !in gre_decoys ) return;
+        local f=forwarded(get_current_packet()$data);
+        if ( f$valid ) frame(f$radio,f$data);
+        return;
+        }
+    local raw=get_current_packet()$data;
+    local r=radio(raw);
+    if ( r$offset == 0 || (r$flags/64)%2 == 1 ) return; # Bad FCS.
+    local data=raw[r$offset:];
+    if ( (r$flags/16)%2 == 1 )
+        { if ( |data| < 4 ) return; data=data[:|data|-4]; }
+    frame(r,data);
     }
 
 event zeek_done()

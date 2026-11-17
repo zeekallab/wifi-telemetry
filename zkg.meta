@@ -1,6 +1,6 @@
 [package]
-description = Standalone radiotap Wi-Fi network/device telemetry and disconnect-burst findings
-version = 0.2.0
+description = Standalone Wi-Fi network/device telemetry and disconnect-burst findings from radiotap captures or raw 802.11 in GRE 0x8200
+version = 0.3.0
 script_dir = scripts
 depends = zeek >=9.0.0
 test_command = python3 tests/test_wifi.py

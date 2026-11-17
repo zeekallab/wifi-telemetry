@@ -66,11 +66,28 @@ not been benchmarked. The snapshot is excluded from the source packages.
 
 ## Input and parser
 
-Version 0.2.0 supports packet input containing a radiotap header followed by an
-802.11 frame. It uses Zeek's `raw_packet` event and does not replace Zeek's built-in
-wireless/IP packet analyzers. The raw handler is opt-in by loading this package;
-it adds per-packet processing cost. It does not require Spicy. An expanded
-decoder could later use a packet analyzer while retaining these logs and policy.
+Two inputs feed one per-frame parser, so the logs are identical whichever is used:
+
+- **Radiotap:** packet input containing a radiotap header followed by an 802.11 frame.
+- **GRE 0x8200 (since v0.3.0):** Ethernet, with any number of 802.1Q/802.1ad tags,
+  then IPv4, then GRE protocol type `0x8200`, then raw 802.11 without radiotap or
+  FCS, addressed to `gre_decoys`. This is the Aruba-style raw 802.11 GRE encoding.
+  It lets a capture box send frames over an ordinary network mirror. Packets that
+  aren't IPv4 GRE to a decoy address return before any parsing.
+  - GRE version must be 0. Checksum and sequence fields are skipped.
+  - When the key flag is set, the high 16 bits are the capture frequency in MHz and
+    the low 16 bits are the signal in dBm (two's complement). Zero means unknown, so
+    `frequency_mhz`, `band` and `signal_dbm` stay absent.
+  - Later IP fragments are ignored. A first fragment is decoded up to the captured
+    length, so a beacon whose information elements don't all fit is rejected like
+    any truncated frame.
+  - The capture side must drop bad-FCS frames and remove FCS and radiotap padding.
+
+The package uses Zeek's `raw_packet` event and does not replace Zeek's built-in
+wireless/IP packet analyzers. The raw handler is active once this package is
+loaded and adds per-packet processing cost. It does not require Spicy. An
+expanded decoder could later use a packet analyzer while retaining these logs and
+policy.
 
 Radiotap decoding covers the prefix through antenna signal: extended presence
 words, TSFT alignment, flags, rate, channel/frequency, FHSS and signed dBm signal.
@@ -133,8 +150,9 @@ also remain in the EAPOL observation count.
 | `advertised_privacy` | Latest beacon/probe-response capability privacy bit, when observed |
 | `rsn_observed`, `wpa_vendor_ie_observed` | Whether corresponding advertisement elements were seen; no negotiated cipher/security claim |
 | `advertised_channels` | Observed DS-parameter advertised channel numbers |
-| `frequency_mhz` | Latest captured frequency from radiotap, when supplied |
+| `frequency_mhz` | Latest captured frequency from radiotap or the GRE key, when supplied |
 | `signal_dbm` | Latest signal of a frame claiming the BSSID as transmitter, when supplied |
+| `randomized_devices` | Distinct locally administered unicast MACs seen as transmitter or receiver in frames attributed to this BSSID, excluding the BSSID itself; capped by `max_randomized_per_network` (sets `tracking_limited` when reached). Counted whether or not those devices are logged individually |
 | `frames`, `management_frames`, `data_frames` | Cumulative accepted observations attributed to the BSSID; control frames excluded |
 | `beacon_frames`, `probe_response_frames`, `authentication_frames` | Cumulative frame-subtype observations |
 | `association_request_frames`, `association_response_frames` | Include reassociation requests/responses respectively |
@@ -170,6 +188,12 @@ Deauthentication/disassociation headers do not authenticate their claimed sender
 | `tx_frames`, `rx_frames` | Cumulative observations using the link-layer transmitter/receiver addresses |
 | `frequency_mhz` | Latest observed radio frequency for traffic referencing this MAC |
 | `signal_dbm` | Latest signal when this MAC was the observed transmitter |
+
+Two options limit device records at busy sites. With `log_randomized_devices = F`,
+locally administered MACs never get device records; they're only counted in
+each network's `randomized_devices`, and probe-request-only randomized MACs aren't
+logged at all. With `log_control_only_devices = F`, RTS/CTS/ACK frames update
+devices already known from management or data frames but never create new ones.
 
 MACs are not stable physical device identities and may be spoofed or randomized.
 Transmitter/receiver positions are not necessarily end-to-end source/destination
@@ -219,8 +243,14 @@ least `minimum_disconnect_frames`, or startup fails with an explanation.
 
 | Option | Default | Scope |
 |---|---:|---|
-| `log_interval` | 60 seconds | Each network/device |
+| `log_interval` | 60 seconds | Each network (devices before v0.3.0) |
+| `device_log_interval` | 60 seconds | Each device |
 | `state_timeout` | 5 minutes | Inactivity expiry per network/device |
+| `gre_input` | T | Accept GRE 0x8200 input |
+| `gre_decoys` | `{ 10.254.200.1 }` | Destination addresses whose GRE 0x8200 is parsed |
+| `log_randomized_devices` | T | Device records for locally administered MACs |
+| `log_control_only_devices` | T | Create device records from control frames alone |
+| `max_randomized_per_network` | 1024 | Distinct randomized MACs counted per network |
 | `burst_interval` | 10 seconds | Each disconnect type/BSSID |
 | `minimum_disconnect_frames` | 20 | Each disconnect type/BSSID |
 | `finding_interval` | 60 seconds | Each finding type/BSSID |

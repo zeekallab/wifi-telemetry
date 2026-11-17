@@ -40,5 +40,6 @@
     "deauthentication",
     "beacon"
   ],
+  "randomized_devices": 1,
   "tracking_limited": false
 }

@@ -1,4 +1,37 @@
-# v0.2.0 validation — 2026-11-17
+# v0.3.0 validation — 2026-11-17
+
+Tested offline using Zeek 9.0.1 and generated packet captures. **Zeek 8.x hasn't
+been tested yet**; the first Zeek 8 run will be on a Corelight sensor.
+
+`python3 tests/test_wifi.py`: **63 tests pass** (one optional full-CSV test is
+skipped when that CSV is absent). That's the 49 v0.2.0 tests, unchanged, plus 14
+new ones:
+
+- **GRE 0x8200 input:**
+  - beacon and deauthentication-burst telemetry and findings, with frequency,
+    band and signal from the key;
+  - output identical to the same frames as radiotap, for networks, devices and
+    findings;
+  - no key, or a zero half in the key, means no guessed frequency or signal;
+  - checksum and sequence fields, one or two VLAN tags, and a first fragment are
+    decoded;
+  - these are ignored: other decoy addresses, other GRE protocol types, later
+    fragments, GRE version 1, truncated payloads, and ordinary Ethernet traffic
+    mixed in;
+  - redefining `gre_decoys` and disabling `gre_input` behave as documented.
+- **`randomized_devices`:** distinct locally administered MACs per network, cap
+  and `tracking_limited` behavior, and counting while device records are
+  suppressed.
+- **`log_randomized_devices = F`** and **`log_control_only_devices = F`**: device
+  suppression, and control frames still updating known devices.
+- **`device_log_interval`** applies independently of the network `log_interval`.
+- Validation of the new options.
+
+Live GRE input was observed on the capture side: a Raspberry Pi forwarder on a home
+LAN, a firewall mirror and a Corelight sensor carried the same frame format into the
+separate drone detector. This package itself hasn't yet been run on that sensor.
+
+## v0.2.0 results (still apply)
 
 Tested offline using Zeek 9.0.1 and generated packet captures. No live sensor
 installation, network traffic injection or production performance testing.

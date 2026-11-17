@@ -1,8 +1,23 @@
 # Wi-Fi telemetry
 
-Standalone Zeek 9.0+ package for **raw radiotap/802.11 captures**. Observes all
-network names and reports wireless activity independently of drone detection.
-Written in Zeek; no Spicy compiler or additional analyzer plugin is required.
+Standalone Zeek 9.0+ package for 802.11 traffic from **radiotap captures** or
+**raw 802.11 forwarded inside GRE (protocol 0x8200) over an ordinary network
+mirror**. Observes all network names and reports wireless activity independently
+of drone detection. Written in Zeek; no Spicy compiler or additional analyzer
+plugin is required.
+
+### v0.3.0 — 2026-11-17
+
+- **GRE 0x8200 input.** A capture box can strip radiotap and send each 802.11
+  frame inside GRE to a decoy address; a mirror delivers it to the sensor. The
+  optional GRE key carries frequency and signal. See [inputs](#inputs).
+- **Volume controls for busy sites:** a separate `device_log_interval`, and
+  options to stop logging individual randomized MACs or devices seen only in
+  control frames. See [busy sites](#busy-sites).
+- New `wifi.log` field `randomized_devices`: distinct locally administered MACs
+  seen on that network.
+- No per-frame set allocation in the packet path. Existing output is unchanged
+  with default settings.
 
 ### v0.2.0 — 2026-11-17
 
@@ -37,7 +52,7 @@ Corelight Asset Management and known-entity integration are deferred.
 
 | Log | Contents |
 |---|---|
-| `wifi.log` | BSSID/network names, advertised privacy/RSN/WPA information, channel/frequency/signal when present, management/data counts, disconnect reasons and authentication/association status codes |
+| `wifi.log` | BSSID/network names, advertised privacy/RSN/WPA information, channel/frequency/signal when present, management/data counts, disconnect reasons and authentication/association status codes, count of randomized (locally administered) devices |
 | `wifi_devices.log` | Observed unicast MACs, transmitted/received frame types and counts, BSSID references, probe network names, transmitter signal when available |
 | `wifi_findings.log` | Deauthentication and disassociation bursts, supporting frame counts, claimed transmitter/receiver addresses, reasons and thresholds |
 
@@ -71,15 +86,51 @@ The repository contains `zkg.meta` for packaging. For Corelight, add it to your
 normal custom package/bundle workflow and validate on a test sensor before rollout.
 No sensor installation or configuration change is performed by this project.
 
-The input must include radiotap and 802.11 headers. A normal Ethernet mirror,
-decapsulated IP feed, or bare 802.11 capture without radiotap does not supply the
-supported input. Encrypted Wi-Fi payloads are not decrypted. See
+## Inputs
+
+Two inputs are accepted, and both produce the same logs:
+
+1. **Radiotap capture:** a monitor-mode interface or pcap with a radiotap header
+   before each 802.11 frame.
+2. **GRE 0x8200 over a mirror:** Ethernet (optionally 802.1Q/802.1ad tagged) /
+   IPv4 / GRE protocol type `0x8200` / raw 802.11, with no radiotap and no FCS, sent
+   to a decoy address. Only GRE addressed to `WiFiTelemetry::gre_decoys` (default
+   `10.254.200.1`) is parsed; all other Ethernet traffic is ignored cheaply.
+   - When the GRE key flag is set, the key is `(frequency MHz << 16) | (signal dBm & 0xffff)`.
+     Zero in either half means unknown.
+   - Checksum and sequence fields are skipped. Only GRE version 0 is accepted.
+   - Only an unfragmented packet or the first IP fragment is decoded.
+
+```zeek
+redef WiFiTelemetry::gre_decoys += { 10.254.201.1 };  # another decoy
+redef WiFiTelemetry::gre_input = F;                   # radiotap only
+```
+
+Decapsulated IP traffic and bare 802.11 without radiotap or GRE are not supported.
+Encrypted Wi-Fi payloads are not decrypted. See
 [scope, log fields and limits](docs/TELEMETRY.md).
+
+## Busy sites
+
+Defaults keep every device record. Where there's a lot of ordinary Wi-Fi, most
+`wifi_devices.log` volume comes from phones' randomized MACs (probe requests) and
+from MACs seen only as RTS/CTS/ACK receivers. To reduce it:
+
+```zeek
+redef WiFiTelemetry::device_log_interval = 15min;       # fewer device updates
+redef WiFiTelemetry::log_randomized_devices = F;        # count them per network instead
+redef WiFiTelemetry::log_control_only_devices = F;      # skip ACK/CTS-only MACs
+```
+
+With `log_randomized_devices = F`, locally administered MACs still appear as each
+network's `randomized_devices` count, but probe-request-only randomized MACs are
+no longer logged anywhere.
 
 ## Logging and findings
 
 Networks and devices produce an initial `observation`, traffic-driven `update`
-records at most once per minute, and a `final` record on inactivity/shutdown
+records at most once per interval (one minute by default; networks use
+`log_interval`, devices `device_log_interval`), and a `final` record on inactivity/shutdown
 only if further activity remains unreported. **Telemetry counts are cumulative
 for the current tracked entity lifetime**, including the first record; do not
 sum repeated snapshots. Inactivity expiry defaults to five minutes.
@@ -91,7 +142,8 @@ No beacon or particular SSID is required. Findings describe suspicious patterns,
 not confirmed malicious intent or successful disruption.
 
 ```zeek
-redef WiFiTelemetry::log_interval = 60secs;
+redef WiFiTelemetry::log_interval = 60secs;          # networks
+redef WiFiTelemetry::device_log_interval = 60secs;   # devices
 redef WiFiTelemetry::minimum_disconnect_frames = 20;
 redef WiFiTelemetry::burst_interval = 10secs;
 redef WiFiTelemetry::finding_interval = 60secs;
@@ -105,6 +157,11 @@ separately and has its own wireless inventory and Remote ID features. Publishing
 this package does not change that repository's loading defaults or Wi-Fi output.
 If using both packages, configure the drone detector's wireless behavior through
 its documented options; loading this package does not disable its wireless logs.
+Each package decodes the GRE 0x8200 stream itself, so loading both parses each
+forwarded frame twice. That costs extra CPU but doesn't duplicate any records.
+
+**From v0.2.0:** `log_interval` now applies to networks only. If you redefined it
+to slow device updates as well, also set `device_log_interval`.
 
 **Migration from the original drone Wi-Fi module:** this standalone package
 writes separate Wi-Fi logs. Update dashboards/searches to the new logs and names:

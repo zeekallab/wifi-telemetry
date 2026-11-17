@@ -42,6 +42,37 @@ def eapol(seq=0, qos=False, flags=2, descriptor=2, radio=RADIO, pad=False):
     return radio + header + bytes.fromhex('aaaa03000000888e') + b'\x02\x03\0\x5f' + bytes([descriptor]) + b'\0' * 94
 
 
+def ipv4_checksum(header):
+    total = sum(struct.unpack('!10H', header))
+    total = (total >> 16) + (total & 0xffff)
+    total += total >> 16
+    return ~total & 0xffff
+
+
+def gre(frame, key=None, mhz=None, dbm=None, dst='10.254.200.1', proto=0x8200, checksum=False,
+        sequence=False, vlans=0, frag_offset=0, more_fragments=False, version=0):
+    """Ethernet [802.1Q] / IPv4 / GRE / raw 802.11, as the capture-side forwarder sends it."""
+    if mhz is not None or dbm is not None:
+        key = ((mhz or 0) << 16) | ((dbm or 0) & 0xffff)
+    flags, options = version, b''
+    if checksum:
+        flags |= 0x8000
+        options += b'\0\0\0\0'
+    if key is not None:
+        flags |= 0x2000
+        options += struct.pack('!I', key)
+    if sequence:
+        flags |= 0x1000
+        options += struct.pack('!I', 7)
+    payload = struct.pack('!HH', flags, proto) + options + frame
+    fragment = (0x2000 if more_fragments else 0) | frag_offset
+    header = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(payload), 1, fragment, 64, 47, 0,
+                         bytes([192, 168, 249, 13]), bytes(int(x) for x in dst.split('.')))
+    header = header[:10] + struct.pack('!H', ipv4_checksum(header)) + header[12:]
+    tags = b''.join(struct.pack('!HH', 0x8100, 100 + i) for i in range(vlans))
+    return bytes.fromhex('dca632d54f7f') + bytes.fromhex('e81cba6a4931') + tags + b'\x08\x00' + header + payload
+
+
 def capture(frames, times=None, linktype=127):
     data = struct.pack('<IHHIIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, linktype)
     for i, frame in enumerate(frames):
@@ -464,6 +495,133 @@ class WiFiTests(unittest.TestCase):
                        wait_for_input=True, allow_warning=True)
             self.assertNotIn('bssid_oui_vendor_hint', final_network(logs))
             self.assertTrue(logs.get('reporter'))
+
+    def test_gre_input_with_key(self):
+        frames = [gre(beacon(b'Forwarded-WiFi', radio=b''), mhz=2437, dbm=-77)]
+        frames += [gre(disconnect(i, radio=b''), mhz=2437, dbm=-77) for i in range(25)]
+        logs = run(frames, linktype=1)
+        row = final_network(logs)
+        self.assertEqual(row['ssid'], 'Forwarded-WiFi')
+        self.assertEqual(row['frequency_mhz'], 2437)
+        self.assertEqual(row['band'], '2.4 GHz')
+        self.assertEqual(row['signal_dbm'], -77)
+        self.assertEqual(row['deauth_frames'], 25)
+        finding = logs['wifi_findings'][0]
+        self.assertEqual(finding['finding'], 'deauthentication_burst')
+        self.assertEqual(finding['frequency_mhz'], 2437)
+        self.assertEqual(logs['wifi_devices'][0]['signal_dbm'], -77)
+
+    def test_gre_matches_radiotap_results(self):
+        radio = struct.pack('<BBHIHHb', 0, 0, 13, 0x28, 5745, 0, -60)
+        frames = [beacon(b'same'), eapol()] + [disconnect(i) for i in range(21)]
+        native = run([radio + f[len(RADIO):] for f in frames])
+        forwarded = run([gre(f[len(RADIO):], mhz=5745, dbm=-60) for f in frames], linktype=1)
+        drop = {'ts', 'first_seen', 'last_seen'}
+
+        def normalized(rows):
+            # Zeek set iteration order isn't defined, so compare sets as sorted lists.
+            return sorted((json.dumps({k: sorted(v, key=str) if isinstance(v, list) else v
+                                       for k, v in r.items() if k not in drop}, sort_keys=True)
+                           for r in rows))
+        for log in ('wifi', 'wifi_devices', 'wifi_findings'):
+            with self.subTest(log=log):
+                self.assertTrue(native[log])
+                self.assertEqual(normalized(native[log]), normalized(forwarded[log]))
+
+    def test_gre_without_key_has_no_radio_metadata(self):
+        row = final_network(run([gre(beacon(radio=b''))], linktype=1))
+        self.assertEqual(row['ssid'], 'ordinary-wifi')
+        for field in ('frequency_mhz', 'band', 'signal_dbm'):
+            self.assertNotIn(field, row)
+
+    def test_gre_key_zero_halves_are_unknown(self):
+        row = final_network(run([gre(beacon(radio=b''), mhz=0, dbm=-50)], linktype=1))
+        self.assertNotIn('frequency_mhz', row)
+        self.assertEqual(row['signal_dbm'], -50)
+        row = final_network(run([gre(beacon(radio=b''), mhz=5180, dbm=0)], linktype=1))
+        self.assertEqual(row['band'], '5 GHz')
+        self.assertNotIn('signal_dbm', row)
+
+    def test_gre_optional_fields_and_vlans(self):
+        for kw in ({'checksum': True}, {'sequence': True}, {'checksum': True, 'sequence': True},
+                   {'vlans': 1}, {'vlans': 2}, {'more_fragments': True}):
+            with self.subTest(**kw):
+                row = final_network(run([gre(beacon(radio=b''), mhz=2412, dbm=-40, **kw)], linktype=1))
+                self.assertEqual(row['ssid'], 'ordinary-wifi')
+                self.assertEqual(row['frequency_mhz'], 2412)
+                self.assertEqual(row['signal_dbm'], -40)
+
+    def test_gre_ignored_inputs(self):
+        cases = {
+            'other decoy': gre(beacon(radio=b''), dst='10.254.200.2'),
+            'other GRE protocol': gre(beacon(radio=b''), proto=0x6558),
+            'later fragment': gre(beacon(radio=b''), frag_offset=185),
+            'GRE version 1': gre(beacon(radio=b''), version=1),
+            'truncated': gre(b'\x80'),
+        }
+        for name, packet in cases.items():
+            with self.subTest(case=name):
+                logs = run([packet], linktype=1)
+                self.assertFalse(logs.get('wifi'))
+                self.assertFalse(logs.get('wifi_devices'))
+
+    def test_gre_input_can_be_disabled_or_redirected(self):
+        packet = gre(beacon(radio=b''), dst='10.1.2.3')
+        self.assertFalse(run([packet], linktype=1).get('wifi'))
+        logs = run([packet], 'redef WiFiTelemetry::gre_decoys += { 10.1.2.3 };\n', linktype=1)
+        self.assertEqual(final_network(logs)['ssid'], 'ordinary-wifi')
+        logs = run([gre(beacon(radio=b''))], 'redef WiFiTelemetry::gre_input = F;\n', linktype=1)
+        self.assertFalse(logs.get('wifi'))
+
+    def test_gre_and_ordinary_lan_traffic(self):
+        arp = BROADCAST + AP + b'\x08\x06' + b'\0' * 46
+        logs = run([arp, gre(beacon(radio=b'')), arp], linktype=1)
+        self.assertEqual(len(logs['wifi']), 1)
+        self.assertEqual(final_network(logs)['beacon_frames'], 1)
+
+    def test_randomized_devices_counted_per_network(self):
+        other_local = bytes.fromhex('1a2b3c4d5e6f')
+        tods = eapol()[:9] + b'\x01' + eapol()[10:12] + AP + other_local + AP + eapol()[30:]
+        logs = run([beacon(), eapol(), eapol(seq=1), tods])
+        row = final_network(logs)
+        self.assertEqual(row['randomized_devices'], 2)
+        self.assertEqual(run([beacon()])['wifi'][-1]['randomized_devices'], 0)
+
+    def test_randomized_device_records_can_be_suppressed(self):
+        settings = 'redef WiFiTelemetry::log_randomized_devices = F;\n'
+        logs = run([beacon(), eapol(), management(4, b'\0\x04home', src=STA, bssid=BROADCAST)], settings)
+        self.assertEqual({d['mac'] for d in logs['wifi_devices']}, {'60:60:1f:58:ec:cc'})
+        self.assertEqual(final_network(logs)['randomized_devices'], 1)
+
+    def test_randomized_count_capacity(self):
+        locals_ = [bytes([0x02, 0, 0, 0, 0, i]) for i in range(5)]
+        frames = [beacon()] + [management(11, b'\0' * 6, dst=m) for m in locals_]
+        row = final_network(run(frames, 'redef WiFiTelemetry::max_randomized_per_network = 3;\n'))
+        self.assertEqual(row['randomized_devices'], 3)
+        self.assertTrue(row['tracking_limited'])
+
+    def test_control_only_devices_can_be_suppressed(self):
+        settings = 'redef WiFiTelemetry::log_control_only_devices = F;\n'
+        rts = RADIO + b'\xb4\0\0\0' + STA + AP
+        ack = RADIO + b'\xd4\0\0\0' + AP
+        self.assertFalse(run([rts, ack], settings).get('wifi_devices'))
+        logs = run([beacon(), rts, ack], settings)
+        self.assertEqual({d['mac'] for d in logs['wifi_devices']}, {'60:60:1f:58:ec:cc'})
+        self.assertIn('control-subtype-13', logs['wifi_devices'][-1]['rx_frame_types'])
+
+    def test_device_interval_is_independent(self):
+        times = [0, 30, 70, 130]
+        frames = [beacon(seq=i) for i in range(4)]
+        logs = run(frames, 'redef WiFiTelemetry::device_log_interval = 120secs;\n', times=times)
+        # Networks update at 70 s and 130 s (60 s interval); the device only at 130 s (120 s).
+        self.assertEqual([r['event_type'] for r in logs['wifi']], ['observation', 'update', 'update'])
+        self.assertEqual([r['event_type'] for r in logs['wifi_devices']], ['observation', 'update'])
+
+    def test_new_options_validated(self):
+        for settings in ('redef WiFiTelemetry::device_log_interval=0secs;\n',
+                         'redef WiFiTelemetry::max_randomized_per_network=0;\n'):
+            with self.assertRaisesRegex(AssertionError, 'positive intervals/capacities required'):
+                run([beacon()], settings)
 
     @unittest.skipUnless((ROOT.parent / 'downloads/oui-review-2026-11-17/ieee-oui.csv').exists(),
                          'Optional official IEEE CSV is not included in the package')
